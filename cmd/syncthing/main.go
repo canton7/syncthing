@@ -36,9 +36,7 @@ import (
 	"github.com/syncthing/syncthing/internal/osutil"
 	"github.com/syncthing/syncthing/internal/symlinks"
 	"github.com/syncthing/syncthing/internal/upgrade"
-	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/errors"
-	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/thejerf/suture"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -78,6 +76,9 @@ func init() {
 			l.Fatalf("Invalid version string %q;\n\tdoes not match regexp %v", Version, exp)
 		}
 	}
+
+	// HAX HAX
+	Version = Version + "-boltdb"
 
 	// Check for a clean release build. A release is something like "v0.1.2",
 	// with an optional suffix of letters and dot separated numbers like
@@ -352,8 +353,8 @@ func main() {
 		l.Infof("Upgrade available (current %q < latest %q)", Version, rel.Tag)
 
 		if doUpgrade {
-			// Use leveldb database locks to protect against concurrent upgrades
-			_, err = leveldb.OpenFile(locations[locDatabase], &opt.Options{OpenFilesCacheCapacity: 100})
+			// Use database locks to protect against concurrent upgrades
+			ldb, err := db.NewBoltDB(locations[locDatabase])
 			if err != nil {
 				l.Infoln("Attempting upgrade through running Syncthing...")
 				err = upgradeViaRest()
@@ -363,6 +364,7 @@ func main() {
 				l.Okln("Syncthing upgrading")
 				return
 			}
+			ldb.Close()
 
 			err = upgrade.To(rel)
 			if err != nil {
@@ -582,10 +584,7 @@ func syncthingMain() {
 	}
 
 	dbFile := locations[locDatabase]
-	ldb, err := leveldb.OpenFile(dbFile, dbOpts())
-	if err != nil && errors.IsCorrupted(err) {
-		ldb, err = leveldb.RecoverFile(dbFile, dbOpts())
-	}
+	ldb, err := db.NewBoltDB(dbFile)
 	if err != nil {
 		l.Fatalln("Cannot open database:", err, "- Is another copy of Syncthing already running?")
 	}
@@ -616,12 +615,6 @@ func syncthingMain() {
 	// needs to be changed when we correctly do persistent indexes.
 	for _, folderCfg := range cfg.Folders() {
 		m.AddFolder(folderCfg)
-		for _, device := range folderCfg.DeviceIDs() {
-			if device == myID {
-				continue
-			}
-			m.Index(device, folderCfg.ID, nil, 0, nil)
-		}
 		// Routine to pull blocks from other devices to synchronize the local
 		// folder. Does not run when we are in read only (publish only) mode.
 		if folderCfg.ReadOnly {
@@ -634,6 +627,15 @@ func syncthingMain() {
 	}
 
 	mainSvc.Add(m)
+
+	for _, folderCfg := range cfg.Folders() {
+		for _, device := range folderCfg.DeviceIDs() {
+			if device == myID {
+				continue
+			}
+			m.Index(device, folderCfg.ID, nil, 0, nil)
+		}
+	}
 
 	// GUI
 
@@ -726,40 +728,6 @@ func syncthingMain() {
 
 	l.Okln("Exiting")
 	os.Exit(code)
-}
-
-func dbOpts() *opt.Options {
-	// Calculate a suitable database block cache capacity.
-
-	// Default is 8 MiB.
-	blockCacheCapacity := 8 << 20
-	// Increase block cache up to this maximum:
-	const maxCapacity = 64 << 20
-	// ... which we reach when the box has this much RAM:
-	const maxAtRAM = 8 << 30
-
-	if v := cfg.Options().DatabaseBlockCacheMiB; v != 0 {
-		// Use the value from the config, if it's set.
-		blockCacheCapacity = v << 20
-	} else if bytes, err := memorySize(); err == nil {
-		// We start at the default of 8 MiB and use larger values for machines
-		// with more memory.
-
-		if bytes > maxAtRAM {
-			// Cap the cache at maxCapacity when we reach maxAtRam amount of memory
-			blockCacheCapacity = maxCapacity
-		} else if bytes > maxAtRAM/maxCapacity*int64(blockCacheCapacity) {
-			// Grow from the default to maxCapacity at maxAtRam amount of memory
-			blockCacheCapacity = int(bytes * maxCapacity / maxAtRAM)
-		}
-		l.Infoln("Database block cache capacity", blockCacheCapacity/1024, "KiB")
-	}
-
-	return &opt.Options{
-		OpenFilesCacheCapacity: 100,
-		BlockCacheCapacity:     blockCacheCapacity,
-		WriteBuffer:            4 << 20,
-	}
 }
 
 func startAuditing(mainSvc *suture.Supervisor) {

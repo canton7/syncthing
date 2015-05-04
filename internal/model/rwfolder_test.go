@@ -14,9 +14,6 @@ import (
 
 	"github.com/syncthing/protocol"
 	"github.com/syncthing/syncthing/internal/scanner"
-
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/storage"
 )
 
 func init() {
@@ -66,7 +63,9 @@ func TestHandleFile(t *testing.T) {
 	requiredFile := existingFile
 	requiredFile.Blocks = blocks[1:]
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
+	db, cleanup := tempDB()
+	defer cleanup()
+
 	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
 	m.AddFolder(defaultFolderConfig)
 	// Update index
@@ -120,7 +119,9 @@ func TestHandleFileWithTemp(t *testing.T) {
 	requiredFile := existingFile
 	requiredFile.Blocks = blocks[1:]
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
+	db, cleanup := tempDB()
+	defer cleanup()
+
 	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
 	m.AddFolder(defaultFolderConfig)
 	// Update index
@@ -180,19 +181,21 @@ func TestCopierFinder(t *testing.T) {
 	requiredFile.Blocks = blocks[1:]
 	requiredFile.Name = "file2"
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
+	db, cleanup := tempDB()
+	defer cleanup()
+
 	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
 	m.AddFolder(defaultFolderConfig)
 	// Update index
 	m.updateLocals("default", []protocol.FileInfo{existingFile})
 
-	iterFn := func(folder, file string, index int32) bool {
+	iterFn := func(folder, file string, index int) bool {
 		return true
 	}
 
 	// Verify that the blocks we say exist on file, really exist in the db.
 	for _, idx := range []int{2, 3, 4, 7} {
-		if m.finder.Iterate(blocks[idx].Hash, iterFn) == false {
+		if m.IterateBlocks(blocks[idx].Hash, iterFn) == false {
 			t.Error("Didn't find block")
 		}
 	}
@@ -251,11 +254,13 @@ func TestCopierFinder(t *testing.T) {
 
 // Test that updating a file removes it's old blocks from the blockmap
 func TestCopierCleanup(t *testing.T) {
-	iterFn := func(folder, file string, index int32) bool {
+	iterFn := func(folder, file string, index int) bool {
 		return true
 	}
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
+	db, cleanup := tempDB()
+	defer cleanup()
+
 	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
 	m.AddFolder(defaultFolderConfig)
 
@@ -270,7 +275,7 @@ func TestCopierCleanup(t *testing.T) {
 	// Add file to index
 	m.updateLocals("default", []protocol.FileInfo{file})
 
-	if !m.finder.Iterate(blocks[0].Hash, iterFn) {
+	if !m.IterateBlocks(blocks[0].Hash, iterFn) {
 		t.Error("Expected block not found")
 	}
 
@@ -279,11 +284,11 @@ func TestCopierCleanup(t *testing.T) {
 	// Update index (removing old blocks)
 	m.updateLocals("default", []protocol.FileInfo{file})
 
-	if m.finder.Iterate(blocks[0].Hash, iterFn) {
+	if m.IterateBlocks(blocks[0].Hash, iterFn) {
 		t.Error("Unexpected block found")
 	}
 
-	if !m.finder.Iterate(blocks[1].Hash, iterFn) {
+	if !m.IterateBlocks(blocks[1].Hash, iterFn) {
 		t.Error("Expected block not found")
 	}
 
@@ -292,11 +297,11 @@ func TestCopierCleanup(t *testing.T) {
 	// Update index (removing old blocks)
 	m.updateLocals("default", []protocol.FileInfo{file})
 
-	if !m.finder.Iterate(blocks[0].Hash, iterFn) {
+	if !m.IterateBlocks(blocks[0].Hash, iterFn) {
 		t.Error("Unexpected block found")
 	}
 
-	if m.finder.Iterate(blocks[1].Hash, iterFn) {
+	if m.IterateBlocks(blocks[1].Hash, iterFn) {
 		t.Error("Expected block not found")
 	}
 }
@@ -304,7 +309,9 @@ func TestCopierCleanup(t *testing.T) {
 // Make sure that the copier routine hashes the content when asked, and pulls
 // if it fails to find the block.
 func TestLastResortPulling(t *testing.T) {
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
+	db, cleanup := tempDB()
+	defer cleanup()
+
 	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
 	m.AddFolder(defaultFolderConfig)
 
@@ -322,12 +329,12 @@ func TestLastResortPulling(t *testing.T) {
 	// with a different name (causing to copy that particular block)
 	file.Name = "newfile"
 
-	iterFn := func(folder, file string, index int32) bool {
+	iterFn := func(folder, file string, index int) bool {
 		return true
 	}
 
 	// Check that that particular block is there
-	if !m.finder.Iterate(blocks[0].Hash, iterFn) {
+	if !m.IterateBlocks(blocks[0].Hash, iterFn) {
 		t.Error("Expected block not found")
 	}
 
@@ -352,11 +359,11 @@ func TestLastResortPulling(t *testing.T) {
 	<-pullChan
 
 	// Verify that it did fix the incorrect hash.
-	if m.finder.Iterate(blocks[0].Hash, iterFn) {
+	if m.IterateBlocks(blocks[0].Hash, iterFn) {
 		t.Error("Found unexpected block")
 	}
 
-	if !m.finder.Iterate(scanner.SHA256OfNothing, iterFn) {
+	if !m.IterateBlocks(scanner.SHA256OfNothing, iterFn) {
 		t.Error("Expected block not found")
 	}
 
@@ -376,7 +383,8 @@ func TestDeregisterOnFailInCopy(t *testing.T) {
 	}
 	defer os.Remove("testdata/" + defTempNamer.TempName("filex"))
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
+	db, cleanup := tempDB()
+	defer cleanup()
 
 	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
 	m.AddFolder(defaultFolderConfig)
@@ -464,7 +472,9 @@ func TestDeregisterOnFailInPull(t *testing.T) {
 	}
 	defer os.Remove("testdata/" + defTempNamer.TempName("filex"))
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
+	db, cleanup := tempDB()
+	defer cleanup()
+
 	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
 	m.AddFolder(defaultFolderConfig)
 

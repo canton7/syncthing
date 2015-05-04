@@ -78,7 +78,8 @@ case "${1:-default}" in
 		go run build.go -goos openbsd -goarch 386 tar
 		go run build.go -goos openbsd -goarch amd64 tar
 
-		go run build.go -goos solaris -goarch amd64 tar
+		# Bolt doesn't build on Solaris, need locking primitives
+		# go run build.go -goos solaris -goarch amd64 tar
 
 		go run build.go -goos windows -goarch 386 zip
 		go run build.go -goos windows -goarch amd64 zip

@@ -9,14 +9,14 @@ package db_test
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/syncthing/protocol"
 	"github.com/syncthing/syncthing/internal/db"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/storage"
 )
 
 var remoteDevice0, remoteDevice1 protocol.DeviceID
@@ -45,6 +45,16 @@ func globalList(s *db.FileSet) []protocol.FileInfo {
 	var fs []protocol.FileInfo
 	s.WithGlobal(func(fi db.FileIntf) bool {
 		f := fi.(protocol.FileInfo)
+		fs = append(fs, f)
+		return true
+	})
+	return fs
+}
+
+func globalListPrefixed(s *db.FileSet, prefix string) []db.FileInfoTruncated {
+	var fs []db.FileInfoTruncated
+	s.WithPrefixedGlobalTruncated(prefix, func(fi db.FileIntf) bool {
+		f := fi.(db.FileInfoTruncated)
 		fs = append(fs, f)
 		return true
 	})
@@ -95,12 +105,22 @@ func (l fileList) String() string {
 	return b.String()
 }
 
-func TestGlobalSet(t *testing.T) {
-
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
+func tempDB() (*db.BoltDB, func()) {
+	ldb, err := db.NewBoltDB(fmt.Sprintf("testdata/test-%d.db", time.Now().UnixNano()))
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
+
+	return ldb, func() {
+		p := ldb.Path()
+		ldb.Close()
+		os.RemoveAll(p)
+	}
+}
+
+func TestGlobalSet(t *testing.T) {
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	m := db.NewFileSet("test", ldb)
 
@@ -256,10 +276,8 @@ func TestGlobalSet(t *testing.T) {
 }
 
 func TestNeedWithInvalid(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	s := db.NewFileSet("test", ldb)
 
@@ -296,10 +314,8 @@ func TestNeedWithInvalid(t *testing.T) {
 }
 
 func TestUpdateToInvalid(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	s := db.NewFileSet("test", ldb)
 
@@ -331,10 +347,8 @@ func TestUpdateToInvalid(t *testing.T) {
 }
 
 func TestInvalidAvailability(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	s := db.NewFileSet("test", ldb)
 
@@ -372,10 +386,9 @@ func TestInvalidAvailability(t *testing.T) {
 }
 
 func TestLocalDeleted(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
+
 	m := db.NewFileSet("test", ldb)
 
 	local1 := []protocol.FileInfo{
@@ -446,10 +459,8 @@ func TestLocalDeleted(t *testing.T) {
 }
 
 func Benchmark10kReplace(b *testing.B) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		b.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	var local []protocol.FileInfo
 	for i := 0; i < 10000; i++ {
@@ -469,10 +480,8 @@ func Benchmark10kUpdateChg(b *testing.B) {
 		remote = append(remote, protocol.FileInfo{Name: fmt.Sprintf("file%d", i), Version: protocol.Vector{{ID: myID, Value: 1000}}})
 	}
 
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		b.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	m := db.NewFileSet("test", ldb)
 	m.Replace(remoteDevice0, remote)
@@ -501,10 +510,9 @@ func Benchmark10kUpdateSme(b *testing.B) {
 		remote = append(remote, protocol.FileInfo{Name: fmt.Sprintf("file%d", i), Version: protocol.Vector{{ID: myID, Value: 1000}}})
 	}
 
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		b.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
+
 	m := db.NewFileSet("test", ldb)
 	m.Replace(remoteDevice0, remote)
 
@@ -521,16 +529,41 @@ func Benchmark10kUpdateSme(b *testing.B) {
 	}
 }
 
+func Benchmark10kUpdateChgOne(b *testing.B) {
+	var remote []protocol.FileInfo
+	for i := 0; i < 10000; i++ {
+		remote = append(remote, protocol.FileInfo{Name: fmt.Sprintf("file%d", i), Version: protocol.Vector{{ID: myID, Value: 1000}}})
+	}
+
+	ldb, cleanup := tempDB()
+	defer cleanup()
+
+	m := db.NewFileSet("test", ldb)
+	m.Replace(remoteDevice0, remote)
+
+	var local []protocol.FileInfo
+	for i := 0; i < 10000; i++ {
+		local = append(local, protocol.FileInfo{Name: fmt.Sprintf("file%d", i), Version: protocol.Vector{{ID: myID, Value: 1000}}})
+	}
+
+	m.ReplaceWithDelete(protocol.LocalDeviceID, local, myID)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		idx := i % 10000
+		local[idx].Version = local[idx].Version.Update(myID)
+		m.Update(protocol.LocalDeviceID, local[idx:idx+1])
+	}
+}
+
 func Benchmark10kNeed2k(b *testing.B) {
 	var remote []protocol.FileInfo
 	for i := 0; i < 10000; i++ {
 		remote = append(remote, protocol.FileInfo{Name: fmt.Sprintf("file%d", i), Version: protocol.Vector{{ID: myID, Value: 1000}}})
 	}
 
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		b.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	m := db.NewFileSet("test", ldb)
 	m.Replace(remoteDevice0, remote)
@@ -560,10 +593,8 @@ func Benchmark10kHaveFullList(b *testing.B) {
 		remote = append(remote, protocol.FileInfo{Name: fmt.Sprintf("file%d", i), Version: protocol.Vector{{ID: myID, Value: 1000}}})
 	}
 
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		b.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	m := db.NewFileSet("test", ldb)
 	m.Replace(remoteDevice0, remote)
@@ -593,10 +624,8 @@ func Benchmark10kGlobal(b *testing.B) {
 		remote = append(remote, protocol.FileInfo{Name: fmt.Sprintf("file%d", i), Version: protocol.Vector{{ID: myID, Value: 1000}}})
 	}
 
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		b.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	m := db.NewFileSet("test", ldb)
 	m.Replace(remoteDevice0, remote)
@@ -621,10 +650,8 @@ func Benchmark10kGlobal(b *testing.B) {
 }
 
 func TestGlobalReset(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	m := db.NewFileSet("test", ldb)
 
@@ -662,10 +689,8 @@ func TestGlobalReset(t *testing.T) {
 }
 
 func TestNeed(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	m := db.NewFileSet("test", ldb)
 
@@ -703,10 +728,8 @@ func TestNeed(t *testing.T) {
 }
 
 func TestLocalVersion(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	m := db.NewFileSet("test", ldb)
 
@@ -742,10 +765,8 @@ func TestLocalVersion(t *testing.T) {
 }
 
 func TestListDropFolder(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	s0 := db.NewFileSet("test0", ldb)
 	local1 := []protocol.FileInfo{
@@ -793,10 +814,8 @@ func TestListDropFolder(t *testing.T) {
 }
 
 func TestGlobalNeedWithInvalid(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	s := db.NewFileSet("test1", ldb)
 
@@ -833,10 +852,8 @@ func TestGlobalNeedWithInvalid(t *testing.T) {
 }
 
 func TestLongPath(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	s := db.NewFileSet("test", ldb)
 
@@ -859,5 +876,50 @@ func TestLongPath(t *testing.T) {
 	if gf[0].Name != local[0].Name {
 		t.Errorf("Incorrect long filename;\n%q !=\n%q",
 			gf[0].Name, local[0].Name)
+	}
+}
+
+func TestGlobalPrefixed(t *testing.T) {
+	ldb, cleanup := tempDB()
+	defer cleanup()
+
+	s := db.NewFileSet("test1", ldb)
+
+	files := fileList{
+		protocol.FileInfo{Name: "a/a1", Version: protocol.Vector{{ID: myID, Value: 1}}, Flags: protocol.FlagDirectory},
+		protocol.FileInfo{Name: "a/a2", Version: protocol.Vector{{ID: myID, Value: 1}}, Blocks: genBlocks(4)},
+		protocol.FileInfo{Name: "a/a3", Version: protocol.Vector{{ID: myID, Value: 1}}, Blocks: genBlocks(4)},
+		protocol.FileInfo{Name: "a/a4", Version: protocol.Vector{{ID: myID, Value: 1}}, Blocks: genBlocks(4)},
+		protocol.FileInfo{Name: "a/b", Version: protocol.Vector{{ID: myID, Value: 1}}, Flags: protocol.FlagDirectory},
+		protocol.FileInfo{Name: "a/b/b1", Version: protocol.Vector{{ID: myID, Value: 1}}, Blocks: genBlocks(4)},
+		protocol.FileInfo{Name: "a/b/b2", Version: protocol.Vector{{ID: myID, Value: 1}}, Blocks: genBlocks(4)},
+		protocol.FileInfo{Name: "a/b/b3", Version: protocol.Vector{{ID: myID, Value: 1}}, Blocks: genBlocks(4)},
+		protocol.FileInfo{Name: "b", Version: protocol.Vector{{ID: myID, Value: 1}}, Flags: protocol.FlagDirectory},
+		protocol.FileInfo{Name: "b/b4", Version: protocol.Vector{{ID: myID, Value: 1}}, Blocks: genBlocks(4)},
+	}
+	s.Replace(protocol.LocalDeviceID, files)
+
+	global := globalListPrefixed(s, "")
+	if actual, expected := len(global), len(files); actual != expected {
+		t.Errorf("Empty prefix got %d files instead of %d", actual, expected)
+		for i, f := range global {
+			t.Logf("%d: %v", i, f)
+		}
+	}
+
+	global = globalListPrefixed(s, "a/b")
+	if actual, expected := len(global), 4; actual != expected {
+		t.Errorf("'a' prefix got %d files instead of %d", actual, expected)
+		for i, f := range global {
+			t.Logf("%d: %v", i, f)
+		}
+	}
+
+	global = globalListPrefixed(s, "b")
+	if actual, expected := len(global), 2; actual != expected {
+		t.Errorf("'a' prefix got %d files instead of %d", actual, expected)
+		for i, f := range global {
+			t.Logf("%d: %v", i, f)
+		}
 	}
 }

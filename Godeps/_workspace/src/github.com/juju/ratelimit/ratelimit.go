@@ -7,10 +7,10 @@
 package ratelimit
 
 import (
-	"math"
 	"strconv"
 	"sync"
 	"time"
+	"math"
 )
 
 // Bucket represents a token bucket that fills at a predetermined rate.

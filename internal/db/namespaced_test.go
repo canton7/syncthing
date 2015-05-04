@@ -9,16 +9,11 @@ package db
 import (
 	"testing"
 	"time"
-
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/storage"
 )
 
 func TestNamespacedInt(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	n1 := NewNamespacedKV(ldb, "foo")
 	n2 := NewNamespacedKV(ldb, "bar")
@@ -53,10 +48,8 @@ func TestNamespacedInt(t *testing.T) {
 }
 
 func TestNamespacedTime(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	n1 := NewNamespacedKV(ldb, "foo")
 
@@ -73,10 +66,8 @@ func TestNamespacedTime(t *testing.T) {
 }
 
 func TestNamespacedString(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	n1 := NewNamespacedKV(ldb, "foo")
 
@@ -89,13 +80,40 @@ func TestNamespacedString(t *testing.T) {
 	if v, ok := n1.String("test"); v != "yo" || !ok {
 		t.Errorf("Incorrect return v %q != \"yo\" || ok %v != true", v, ok)
 	}
+
+	n1.Delete("test")
+
+	if v, ok := n1.String("test"); v != "" || ok {
+		t.Errorf("Incorrect return v %q != \"\" || ok %v != false", v, ok)
+	}
+}
+
+func TestNamespacedBytes(t *testing.T) {
+	ldb, cleanup := tempDB()
+	defer cleanup()
+
+	n1 := NewNamespacedKV(ldb, "foo")
+
+	if v, ok := n1.Bytes("test"); v != nil || ok {
+		t.Errorf("Incorrect return v %q != \"\" || ok %v != false", v, ok)
+	}
+
+	n1.PutBytes("test", []byte("yo"))
+
+	if v, ok := n1.Bytes("test"); string(v) != "yo" || !ok {
+		t.Errorf("Incorrect return v %q != \"yo\" || ok %v != true", v, ok)
+	}
+
+	n1.Delete("test")
+
+	if v, ok := n1.Bytes("test"); v != nil || ok {
+		t.Errorf("Incorrect return v %q != nil || ok %v != false", v, ok)
+	}
 }
 
 func TestNamespacedReset(t *testing.T) {
-	ldb, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	n1 := NewNamespacedKV(ldb, "foo")
 

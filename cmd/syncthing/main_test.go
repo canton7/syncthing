@@ -7,17 +7,29 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/syncthing/protocol"
 	"github.com/syncthing/syncthing/internal/config"
 	"github.com/syncthing/syncthing/internal/db"
 	"github.com/syncthing/syncthing/internal/model"
-
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/storage"
 )
+
+func tempDB() (*db.BoltDB, func()) {
+	ldb, err := db.NewBoltDB(fmt.Sprintf("testdata/test-%d.db", time.Now().UnixNano()))
+	if err != nil {
+		panic(err)
+	}
+
+	return ldb, func() {
+		p := ldb.Path()
+		ldb.Close()
+		os.RemoveAll(p)
+	}
+}
 
 func TestFolderErrors(t *testing.T) {
 	// This test intentionally avoids starting the folders. If they are
@@ -38,7 +50,8 @@ func TestFolderErrors(t *testing.T) {
 		}
 	}
 
-	ldb, _ := leveldb.Open(storage.NewMemStorage(), nil)
+	ldb, cleanup := tempDB()
+	defer cleanup()
 
 	// Case 1 - new folder, directory and marker created
 

@@ -34,7 +34,6 @@ import (
 	"github.com/syncthing/syncthing/internal/symlinks"
 	"github.com/syncthing/syncthing/internal/sync"
 	"github.com/syncthing/syncthing/internal/versioner"
-	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/thejerf/suture"
 )
 
@@ -66,8 +65,7 @@ type Model struct {
 	*suture.Supervisor
 
 	cfg             *config.Wrapper
-	db              *leveldb.DB
-	finder          *db.BlockFinder
+	db              *db.BoltDB
 	progressEmitter *ProgressEmitter
 	id              protocol.DeviceID
 	shortID         uint64
@@ -96,6 +94,9 @@ type Model struct {
 
 	reqValidationCache map[string]time.Time // folder / file name => time when confirmed to exist
 	rvmut              sync.RWMutex         // protects reqValidationCache
+
+	indexReceiver *indexReceiver
+	indexWriter   *indexWriter
 }
 
 var (
@@ -105,7 +106,7 @@ var (
 // NewModel creates and starts a new model. The model starts in read-only mode,
 // where it sends index information to connected peers and responds to requests
 // for file data without altering the local folder in any way.
-func NewModel(cfg *config.Wrapper, id protocol.DeviceID, deviceName, clientName, clientVersion string, ldb *leveldb.DB) *Model {
+func NewModel(cfg *config.Wrapper, id protocol.DeviceID, deviceName, clientName, clientVersion string, ldb *db.BoltDB) *Model {
 	m := &Model{
 		Supervisor: suture.New("model", suture.Spec{
 			Log: func(line string) {
@@ -116,7 +117,6 @@ func NewModel(cfg *config.Wrapper, id protocol.DeviceID, deviceName, clientName,
 		}),
 		cfg:                cfg,
 		db:                 ldb,
-		finder:             db.NewBlockFinder(ldb, cfg),
 		progressEmitter:    NewProgressEmitter(cfg),
 		id:                 id,
 		shortID:            id.Short(),
@@ -141,8 +141,13 @@ func NewModel(cfg *config.Wrapper, id protocol.DeviceID, deviceName, clientName,
 		rvmut: sync.NewRWMutex(),
 	}
 	if cfg.Options().ProgressUpdateIntervalS > -1 {
-		go m.progressEmitter.Serve()
+		m.Add(m.progressEmitter)
 	}
+
+	m.indexReceiver = newIndexReceiver()
+	m.Add(m.indexReceiver)
+	m.indexWriter = newIndexWriter(m.indexReceiver, m)
+	m.Add(m.indexWriter)
 
 	return m
 }
@@ -211,7 +216,7 @@ func (m *Model) StartFolderRO(folder string) {
 	m.folderRunners[folder] = s
 	m.fmut.Unlock()
 
-	go s.Serve()
+	m.Add(s)
 }
 
 type ConnectionInfo struct {
@@ -491,21 +496,6 @@ func (m *Model) Index(deviceID protocol.DeviceID, folder string, fs []protocol.F
 		return
 	}
 
-	m.fmut.RLock()
-	files, ok := m.folderFiles[folder]
-	runner := m.folderRunners[folder]
-	m.fmut.RUnlock()
-
-	if runner != nil {
-		// Runner may legitimately not be set if this is the "cleanup" Index
-		// message at startup.
-		defer runner.IndexUpdated()
-	}
-
-	if !ok {
-		l.Fatalf("Index for nonexistant folder %q", folder)
-	}
-
 	for i := 0; i < len(fs); {
 		if fs[i].Flags&^protocol.FlagsAll != 0 {
 			if debug {
@@ -524,14 +514,7 @@ func (m *Model) Index(deviceID protocol.DeviceID, folder string, fs []protocol.F
 		}
 	}
 
-	files.Replace(deviceID, fs)
-
-	events.Default.Log(events.RemoteIndexUpdated, map[string]interface{}{
-		"device":  deviceID.String(),
-		"folder":  folder,
-		"items":   len(fs),
-		"version": files.LocalVersion(deviceID),
-	})
+	m.indexReceiver.Receive(folder, deviceID, true, fs)
 }
 
 // IndexUpdate is called for incremental updates to connected devices' indexes.
@@ -551,15 +534,6 @@ func (m *Model) IndexUpdate(deviceID protocol.DeviceID, folder string, fs []prot
 		return
 	}
 
-	m.fmut.RLock()
-	files := m.folderFiles[folder]
-	runner, ok := m.folderRunners[folder]
-	m.fmut.RUnlock()
-
-	if !ok {
-		l.Fatalf("IndexUpdate for nonexistant folder %q", folder)
-	}
-
 	for i := 0; i < len(fs); {
 		if fs[i].Flags&^protocol.FlagsAll != 0 {
 			if debug {
@@ -578,16 +552,7 @@ func (m *Model) IndexUpdate(deviceID protocol.DeviceID, folder string, fs []prot
 		}
 	}
 
-	files.Update(deviceID, fs)
-
-	events.Default.Log(events.RemoteIndexUpdated, map[string]interface{}{
-		"device":  deviceID.String(),
-		"folder":  folder,
-		"items":   len(fs),
-		"version": files.LocalVersion(deviceID),
-	})
-
-	runner.IndexUpdated()
+	m.indexReceiver.Receive(folder, deviceID, false, fs)
 }
 
 func (m *Model) folderSharedWith(folder string, deviceID protocol.DeviceID) bool {
@@ -1063,6 +1028,7 @@ func sendIndexTo(initial bool, minLocalVer int64, conn protocol.Connection, fold
 	maxLocalVer := int64(0)
 	var err error
 
+	var batches [][]protocol.FileInfo
 	fs.WithHave(protocol.LocalDeviceID, func(fi db.FileIntf) bool {
 		f := fi.(protocol.FileInfo)
 		if f.LocalVersion <= minLocalVer {
@@ -1081,22 +1047,7 @@ func sendIndexTo(initial bool, minLocalVer int64, conn protocol.Connection, fold
 		}
 
 		if len(batch) == indexBatchSize || currentBatchSize > indexTargetSize {
-			if initial {
-				if err = conn.Index(folder, batch, 0, nil); err != nil {
-					return false
-				}
-				if debug {
-					l.Debugf("sendIndexes for %s-%s/%q: %d files (<%d bytes) (initial index)", deviceID, name, folder, len(batch), currentBatchSize)
-				}
-				initial = false
-			} else {
-				if err = conn.IndexUpdate(folder, batch, 0, nil); err != nil {
-					return false
-				}
-				if debug {
-					l.Debugf("sendIndexes for %s-%s/%q: %d files (<%d bytes) (batched update)", deviceID, name, folder, len(batch), currentBatchSize)
-				}
-			}
+			batches = append(batches, batch)
 
 			batch = make([]protocol.FileInfo, 0, indexBatchSize)
 			currentBatchSize = 0
@@ -1106,20 +1057,30 @@ func sendIndexTo(initial bool, minLocalVer int64, conn protocol.Connection, fold
 		currentBatchSize += indexPerFileSize + len(f.Blocks)*indexPerBlockSize
 		return true
 	})
+	if len(batch) > 0 {
+		batches = append(batches, batch)
+	}
 
-	if initial && err == nil {
-		err = conn.Index(folder, batch, 0, nil)
-		if debug && err == nil {
-			l.Debugf("sendIndexes for %s-%s/%q: %d files (small initial index)", deviceID, name, folder, len(batch))
-		}
-	} else if len(batch) > 0 && err == nil {
-		err = conn.IndexUpdate(folder, batch, 0, nil)
-		if debug && err == nil {
-			l.Debugf("sendIndexes for %s-%s/%q: %d files (last batch)", deviceID, name, folder, len(batch))
+	for _, batch = range batches {
+		if initial {
+			if err = conn.Index(folder, batch, 0, nil); err != nil {
+				return maxLocalVer, err
+			}
+			if debug {
+				l.Debugf("sendIndexes for %s-%s/%q: %d files (<%d bytes) (initial index)", deviceID, name, folder, len(batch), currentBatchSize)
+			}
+			initial = false
+		} else {
+			if err = conn.IndexUpdate(folder, batch, 0, nil); err != nil {
+				return maxLocalVer, err
+			}
+			if debug {
+				l.Debugf("sendIndexes for %s-%s/%q: %d files (<%d bytes) (batched update)", deviceID, name, folder, len(batch), currentBatchSize)
+			}
 		}
 	}
 
-	return maxLocalVer, err
+	return maxLocalVer, nil
 }
 
 func (m *Model) updateLocals(folder string, fs []protocol.FileInfo) {
@@ -1507,34 +1468,19 @@ func (m *Model) Override(folder string) {
 		return
 	}
 
-	runner.setState(FolderScanning)
-	batch := make([]protocol.FileInfo, 0, indexBatchSize)
-	fs.WithNeed(protocol.LocalDeviceID, func(fi db.FileIntf) bool {
-		need := fi.(protocol.FileInfo)
-		if len(batch) == indexBatchSize {
-			m.updateLocals(folder, batch)
-			batch = batch[:0]
-		}
+	curV := fs.LocalVersion(protocol.LocalDeviceID)
 
-		have, ok := fs.Get(protocol.LocalDeviceID, need.Name)
-		if !ok || have.Name != need.Name {
-			// We are missing the file
-			need.Flags |= protocol.FlagDeleted
-			need.Blocks = nil
-			need.Version = need.Version.Update(m.shortID)
-		} else {
-			// We have the file, replace with our version
-			have.Version = have.Version.Merge(need.Version).Update(m.shortID)
-			need = have
-		}
-		need.LocalVersion = 0
-		batch = append(batch, need)
-		return true
-	})
-	if len(batch) > 0 {
-		m.updateLocals(folder, batch)
-	}
+	runner.setState(FolderScanning)
+	fs.OverrideRemoteChanges(folder)
 	runner.setState(FolderIdle)
+
+	newV := fs.LocalVersion(protocol.LocalDeviceID)
+
+	events.Default.Log(events.LocalIndexUpdated, map[string]interface{}{
+		"folder":  folder,
+		"items":   newV - curV, // best guess at how many files where changed
+		"version": newV,
+	})
 }
 
 // CurrentLocalVersion returns the change version for the given folder.
@@ -1743,6 +1689,36 @@ func (m *Model) ResetFolder(folder string) error {
 	return fmt.Errorf("Unknown folder %q", folder)
 }
 
+func (m *Model) IterateBlocks(hash []byte, fn func(folder, file string, idx int) bool) bool {
+	m.fmut.RLock()
+	fss := make(map[string]*db.FileSet, len(m.folderFiles))
+	for folder, fs := range m.folderFiles {
+		fss[folder] = fs
+	}
+	m.fmut.RUnlock()
+
+	for folder, fs := range fss {
+		done := fs.IterateBlocks(hash, func(file string, idx int) bool {
+			return fn(folder, file, idx)
+		})
+		if done {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (m *Model) FixBlock(folder, file string, index int, oldHash, newHash []byte) {
+	m.fmut.RLock()
+	fs, ok := m.folderFiles[folder]
+	m.fmut.RUnlock()
+	if !ok {
+		return
+	}
+	fs.FixBlock(file, index, oldHash, newHash)
+}
+
 func (m *Model) String() string {
 	return fmt.Sprintf("model@%p", m)
 }
@@ -1810,4 +1786,149 @@ func getChunk(data []string, skip, get int) ([]string, int, int) {
 		return data[skip:l], 0, get - (l - skip)
 	}
 	return data[skip : skip+get], 0, 0
+}
+
+// Incoming Index and IndexUpdate messages get sent to the indexReceiver. The
+// indexReceiver is designed to never block and queues arbitrarily many index
+// messages. The indexWriter works off of the indexReceivers buffer and writes
+// the changes to the database. The actual database update calls may block,
+// but this does not block the indexReceiver.
+
+type indexOperation struct {
+	folder  string
+	device  protocol.DeviceID
+	replace bool
+	files   []protocol.FileInfo
+}
+
+type indexReceiver struct {
+	operations []indexOperation
+	mut        sync.Mutex
+	cond       *stdsync.Cond
+	inbox      chan indexOperation
+}
+
+func newIndexReceiver() *indexReceiver {
+	r := &indexReceiver{
+		mut:   sync.NewMutex(),
+		inbox: make(chan indexOperation),
+	}
+	r.cond = stdsync.NewCond(r.mut)
+	return r
+}
+
+func (r *indexReceiver) Receive(folder string, device protocol.DeviceID, replace bool, files []protocol.FileInfo) {
+	r.inbox <- indexOperation{
+		folder:  folder,
+		device:  device,
+		replace: replace,
+		files:   files,
+	}
+}
+
+func (r *indexReceiver) Serve() {
+	for op := range r.inbox {
+		r.mut.Lock()
+		r.operations = append(r.operations, op)
+		if debug {
+			l.Debugln(r, "buffered", len(r.operations))
+		}
+		r.cond.Broadcast()
+		r.mut.Unlock()
+	}
+}
+
+func (r *indexReceiver) Stop() {
+	// Never stop, never surrender!
+}
+
+func (r *indexReceiver) String() string {
+	return fmt.Sprintf("indexReceiver@%p", r)
+}
+
+type indexWriter struct {
+	recv          *indexReceiver
+	model         *Model
+	processed     int
+	processedMut  sync.Mutex
+	processedCond *stdsync.Cond
+}
+
+func newIndexWriter(recv *indexReceiver, model *Model) *indexWriter {
+	w := &indexWriter{
+		recv:         recv,
+		model:        model,
+		processedMut: sync.NewMutex(),
+	}
+	w.processedCond = stdsync.NewCond(w.processedMut)
+	return w
+}
+
+func (w *indexWriter) Serve() {
+	for {
+		w.recv.mut.Lock()
+		for len(w.recv.operations) == 0 {
+			w.recv.cond.Wait()
+		}
+
+		op := w.recv.operations[0]
+		w.recv.operations = w.recv.operations[1:]
+		w.recv.mut.Unlock()
+
+		if debug {
+			l.Debugln(w, "writing")
+		}
+
+		w.model.fmut.RLock()
+		files := w.model.folderFiles[op.folder]
+		runner := w.model.folderRunners[op.folder]
+		w.model.fmut.RUnlock()
+
+		if files == nil {
+			// Update for nonexistent folder
+			continue
+		}
+
+		if op.replace {
+			files.Replace(op.device, op.files)
+		} else {
+			files.Update(op.device, op.files)
+		}
+
+		events.Default.Log(events.RemoteIndexUpdated, map[string]interface{}{
+			"device":  op.device.String(),
+			"folder":  op.folder,
+			"items":   len(op.files),
+			"version": files.LocalVersion(op.device),
+		})
+
+		if runner != nil {
+			runner.IndexUpdated()
+		}
+
+		w.processedMut.Lock()
+		w.processed++
+		w.processedCond.Broadcast()
+		w.processedMut.Unlock()
+	}
+}
+
+func (w *indexWriter) Stop() {
+	// Never stop, never surrender!
+}
+
+func (w *indexWriter) String() string {
+	return fmt.Sprintf("indexWriter@%p", w)
+}
+
+// waitFor waits for p transactions to have been committed. This enabled
+// syncrhonous tests, we we call model.Index(...) and then
+// model.indexWriter.waitFor(1) to make sure it has actually happened and not
+// just been queued.
+func (w *indexWriter) waitFor(p int) {
+	w.processedMut.Lock()
+	for w.processed < p {
+		w.processedCond.Wait()
+	}
+	w.processedMut.Unlock()
 }

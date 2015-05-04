@@ -10,6 +10,11 @@
 			"Rev": "4f7c2045dbd17b802370e2e6022200468abf02ba"
 		},
 		{
+			"ImportPath": "github.com/boltdb/bolt",
+			"Comment": "v1.0-106-g5eb31d5",
+			"Rev": "5eb31d5821750fbc84284d610c0ce85261662adb"
+		},
+		{
 			"ImportPath": "github.com/calmh/logger",
 			"Rev": "c96f6a1a8c7b6bf2f4860c667867d90174799eb2"
 		},
@@ -20,10 +25,6 @@
 		{
 			"ImportPath": "github.com/calmh/xdr",
 			"Rev": "5f7208e86762911861c94f1849eddbfc0a60cbf0"
-		},
-		{
-			"ImportPath": "github.com/google/go-snappy/snappy",
-			"Rev": "eaa750b9bf4dcb7cb20454be850613b66cda3273"
 		},
 		{
 			"ImportPath": "github.com/juju/ratelimit",
@@ -38,7 +39,15 @@
 			"Rev": "e7db2648034fb71b051902a02bc25d4468ed492e"
 		},
 		{
-			"ImportPath": "github.com/syndtr/goleveldb/leveldb",
+			"ImportPath": "github.com/syndtr/goleveldb/leveldb/errors",
+			"Rev": "a06509502ca32565bdf74afc1e573050023f261c"
+		},
+		{
+			"ImportPath": "github.com/syndtr/goleveldb/leveldb/storage",
+			"Rev": "a06509502ca32565bdf74afc1e573050023f261c"
+		},
+		{
+			"ImportPath": "github.com/syndtr/goleveldb/leveldb/util",
 			"Rev": "a06509502ca32565bdf74afc1e573050023f261c"
 		},
 		{
