@@ -45,6 +45,7 @@ const (
 	FolderResumed
 	ListenAddressesChanged
 	LoginAttempt
+	ConflictFileCreated
 
 	AllEvents = (1 << iota) - 1
 )
@@ -109,6 +110,8 @@ func (t EventType) String() string {
 		return "ListenAddressesChanged"
 	case LoginAttempt:
 		return "LoginAttempt"
+	case ConflictFileCreated:
+		return "ConflictFileCreated"
 	default:
 		return "Unknown"
 	}

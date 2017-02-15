@@ -195,7 +195,14 @@ func (s *verboseService) formatEvent(ev events.Event) string {
 			success = "failed"
 		}
 		return fmt.Sprintf("Login %s for username %s.", success, username)
+
+	case events.ConflictFileCreated:
+		data := ev.Data.(map[string]interface{})
+		originalFile := data["originalFile"]
+		conflictFile := data["conflictFile"]
+		return fmt.Sprintf("Conflict file %s created from %s", conflictFile, originalFile)
 	}
+
 
 	return fmt.Sprintf("%s %#v", ev.Type, ev)
 }

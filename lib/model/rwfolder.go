@@ -1676,6 +1676,12 @@ func (f *sendReceiveFolder) moveForConflict(name string) error {
 	ext := filepath.Ext(name)
 	withoutExt := name[:len(name)-len(ext)]
 	newName := withoutExt + time.Now().Format(".sync-conflict-20060102-150405") + ext
+	// go func() {
+	// 	events.Default.Log(events.ConflictFileCreated, map[string]interface{}{
+	// 		"originalFile": name,
+	// 		"conflictFile": newName,
+	// 	})
+	// }()
 	err := os.Rename(name, newName)
 	if os.IsNotExist(err) {
 		// We were supposed to move a file away but it does not exist. Either
